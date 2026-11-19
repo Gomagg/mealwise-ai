@@ -4,6 +4,7 @@ import path from "path";
 import crypto from "crypto";
 import { cookies } from "next/headers";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import { get as blobGet, put as blobPut } from "@vercel/blob";
 import type {
   Conversation,
   GroceryList,
@@ -69,9 +70,60 @@ function db(): Db {
   }
 }
 
-function save(data: Db) {
+// On Vercel the local file lives in os.tmpdir() and is per-instance. When a
+// Vercel Blob store is linked, hydrate the JSON document from Blob on first
+// use and mirror every write back, so sessions and plans survive cold starts.
+const USE_BLOB = Boolean(process.env.VERCEL && process.env.BLOB_READ_WRITE_TOKEN);
+const BLOB_PATH = "mealwise/db.json";
+// Blob is the source of truth, but a page render calls the store several times.
+// Coalesce concurrent reads and refresh at most once per second, so separate
+// instances converge quickly without a Blob request per individual lookup.
+const SYNC_MS = 1000;
+let hydration: Promise<void> | null = null;
+let hydratedAt = 0;
+
+async function ensureHydrated(): Promise<void> {
+  if (!USE_BLOB) return;
+  if (!hydration || Date.now() - hydratedAt > SYNC_MS) {
+    hydratedAt = Date.now();
+    hydration = (async () => {
+      try {
+        const found = await blobGet(BLOB_PATH, {
+          access: "private",
+          token: process.env.BLOB_READ_WRITE_TOKEN,
+          useCache: false,
+        });
+        if (!found) return;
+        const text = await new Response(found.stream).text();
+        if (text) writeLocal(JSON.parse(text) as Db);
+      } catch {
+        // No readable store yet: start with an empty document.
+      }
+    })();
+  }
+  await hydration;
+}
+
+function writeLocal(data: Db) {
   if (!fs.existsSync(DIR)) fs.mkdirSync(DIR, { recursive: true });
   fs.writeFileSync(FILE, JSON.stringify(data, null, 2));
+}
+
+async function save(data: Db) {
+  writeLocal(data);
+  if (USE_BLOB) {
+    try {
+      await blobPut(BLOB_PATH, JSON.stringify(data), {
+        access: "private",
+        addRandomSuffix: false,
+        allowOverwrite: true,
+        contentType: "application/json",
+        token: process.env.BLOB_READ_WRITE_TOKEN,
+      });
+    } catch {
+      // A failed mirror write must not break the request; the next save retries.
+    }
+  }
 }
 
 // ------------------------------ auth ---------------------------------------
@@ -90,6 +142,7 @@ function checkPassword(password: string, stored: string): boolean {
 }
 
 export async function register(email: string, password: string): Promise<Profile> {
+  await ensureHydrated();
   email = email.trim().toLowerCase();
   if (backend === "supabase") {
     const { data, error } = await sb().auth.admin.createUser({ email, password, email_confirm: true });
@@ -110,11 +163,12 @@ export async function register(email: string, password: string): Promise<Profile
   };
   d.profiles[profile.id] = profile;
   d.emailToId[email] = profile.id;
-  save(d);
+  await save(d);
   return profile;
 }
 
 export async function login(email: string, password: string): Promise<Profile> {
+  await ensureHydrated();
   email = email.trim().toLowerCase();
   if (backend === "supabase") {
     const { data, error } = await sb().auth.signInWithPassword({ email, password });
@@ -136,13 +190,14 @@ export async function login(email: string, password: string): Promise<Profile> {
 }
 
 export async function createSession(userId: string): Promise<void> {
+  await ensureHydrated();
   const token = crypto.randomBytes(24).toString("hex");
   if (backend === "supabase") {
     await sb().from("app_sessions").insert({ token, user_id: userId });
   } else {
     const d = db();
     d.sessions[token] = userId;
-    save(d);
+    await save(d);
   }
   (await cookies()).set(COOKIE, token, {
     httpOnly: true,
@@ -154,6 +209,7 @@ export async function createSession(userId: string): Promise<void> {
 }
 
 export async function destroySession(): Promise<void> {
+  await ensureHydrated();
   const jar = await cookies();
   const token = jar.get(COOKIE)?.value;
   if (token) {
@@ -161,13 +217,14 @@ export async function destroySession(): Promise<void> {
     else {
       const d = db();
       delete d.sessions[token];
-      save(d);
+      await save(d);
     }
   }
   jar.delete(COOKIE);
 }
 
 export async function currentUser(): Promise<Profile | null> {
+  await ensureHydrated();
   const token = (await cookies()).get(COOKIE)?.value;
   if (!token) return null;
   if (backend === "supabase") {
@@ -188,6 +245,7 @@ export async function currentUser(): Promise<Profile | null> {
 // ------------------------------ prefs --------------------------------------
 
 export async function getPreferences(userId: string): Promise<Preferences | null> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { data } = await sb().from("user_preferences").select("data").eq("user_id", userId).maybeSingle();
     return (data?.data as Preferences) ?? null;
@@ -196,6 +254,7 @@ export async function getPreferences(userId: string): Promise<Preferences | null
 }
 
 export async function savePreferences(prefs: Preferences): Promise<void> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { error } = await sb().from("user_preferences").upsert({ user_id: prefs.userId, data: prefs });
     if (error) throw new Error(error.message);
@@ -203,12 +262,13 @@ export async function savePreferences(prefs: Preferences): Promise<void> {
   }
   const d = db();
   d.prefs[prefs.userId] = prefs;
-  save(d);
+  await save(d);
 }
 
 // ------------------------------ meal plans ---------------------------------
 
 export async function savePlan(plan: MealPlan): Promise<void> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { error } = await sb().from("meal_plans").upsert({
       id: plan.id,
@@ -231,10 +291,11 @@ export async function savePlan(plan: MealPlan): Promise<void> {
   }
   const d = db();
   d.plans[plan.id] = plan;
-  save(d);
+  await save(d);
 }
 
 export async function listPlans(userId: string): Promise<MealPlan[]> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { data } = await sb().from("meal_plans").select("*").eq("user_id", userId).order("created_at", { ascending: false });
     return (data ?? []).map((r) => ({
@@ -248,6 +309,7 @@ export async function listPlans(userId: string): Promise<MealPlan[]> {
 }
 
 export async function getPlan(userId: string, id: string): Promise<MealPlan | null> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { data } = await sb().from("meal_plans").select("*").eq("id", id).eq("user_id", userId).maybeSingle();
     return data ? {
@@ -262,6 +324,7 @@ export async function getPlan(userId: string, id: string): Promise<MealPlan | nu
 }
 
 export async function deletePlan(userId: string, id: string): Promise<boolean> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { error } = await sb().from("meal_plans").delete().eq("id", id).eq("user_id", userId);
     return !error;
@@ -270,13 +333,14 @@ export async function deletePlan(userId: string, id: string): Promise<boolean> {
   const plan = d.plans[id];
   if (!plan || plan.userId !== userId) return false;
   delete d.plans[id];
-  save(d);
+  await save(d);
   return true;
 }
 
 // ------------------------------ grocery lists ------------------------------
 
 export async function saveList(list: GroceryList): Promise<void> {
+  await ensureHydrated();
   if (backend === "supabase") {
     await sb().from("grocery_lists").upsert({
       id: list.id, user_id: list.userId, meal_plan_id: list.mealPlanId, title: list.title,
@@ -286,10 +350,11 @@ export async function saveList(list: GroceryList): Promise<void> {
   }
   const d = db();
   d.lists[list.id] = list;
-  save(d);
+  await save(d);
 }
 
 export async function listLists(userId: string): Promise<GroceryList[]> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { data } = await sb().from("grocery_lists").select("*").eq("user_id", userId).order("created_at", { ascending: false });
     return (data ?? []).map((r) => ({
@@ -301,6 +366,7 @@ export async function listLists(userId: string): Promise<GroceryList[]> {
 }
 
 export async function getList(userId: string, id: string): Promise<GroceryList | null> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { data } = await sb().from("grocery_lists").select("*").eq("id", id).eq("user_id", userId).maybeSingle();
     return data ? {
@@ -313,6 +379,7 @@ export async function getList(userId: string, id: string): Promise<GroceryList |
 }
 
 export async function getListForPlan(userId: string, planId: string): Promise<GroceryList | null> {
+  await ensureHydrated();
   const all = await listLists(userId);
   return all.find((l) => l.mealPlanId === planId) ?? null;
 }
@@ -320,6 +387,7 @@ export async function getListForPlan(userId: string, planId: string): Promise<Gr
 // ------------------------------ pantry -------------------------------------
 
 export async function listPantry(userId: string): Promise<PantryItem[]> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { data } = await sb().from("pantry_items").select("*").eq("user_id", userId);
     return (data ?? []).map((r) => ({
@@ -332,6 +400,7 @@ export async function listPantry(userId: string): Promise<PantryItem[]> {
 }
 
 export async function savePantryItem(item: PantryItem): Promise<void> {
+  await ensureHydrated();
   if (backend === "supabase") {
     await sb().from("pantry_items").upsert({
       id: item.id, user_id: item.userId, name: item.name, qty: item.qty, unit: item.unit,
@@ -342,10 +411,11 @@ export async function savePantryItem(item: PantryItem): Promise<void> {
   }
   const d = db();
   d.pantry[item.id] = item;
-  save(d);
+  await save(d);
 }
 
 export async function deletePantryItem(userId: string, id: string): Promise<void> {
+  await ensureHydrated();
   if (backend === "supabase") {
     await sb().from("pantry_items").delete().eq("id", id).eq("user_id", userId);
     return;
@@ -354,23 +424,25 @@ export async function deletePantryItem(userId: string, id: string): Promise<void
   const item = d.pantry[id];
   if (item && item.userId === userId) {
     delete d.pantry[id];
-    save(d);
+    await save(d);
   }
 }
 
 // ------------------------------ conversations ------------------------------
 
 export async function saveConversation(conv: Conversation): Promise<void> {
+  await ensureHydrated();
   if (backend === "supabase") {
     await sb().from("ai_conversations").upsert({ id: conv.id, user_id: conv.userId, title: conv.title, messages: conv.messages, created_at: conv.createdAt });
     return;
   }
   const d = db();
   d.convs[conv.id] = conv;
-  save(d);
+  await save(d);
 }
 
 export async function listConversations(userId: string): Promise<Conversation[]> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { data } = await sb().from("ai_conversations").select("*").eq("user_id", userId).order("created_at", { ascending: false });
     return (data ?? []).map((r) => ({ id: r.id, userId: r.user_id, title: r.title, createdAt: r.created_at, messages: r.messages ?? [] }));
@@ -379,6 +451,7 @@ export async function listConversations(userId: string): Promise<Conversation[]>
 }
 
 export async function getConversation(userId: string, id: string): Promise<Conversation | null> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { data } = await sb().from("ai_conversations").select("*").eq("id", id).eq("user_id", userId).maybeSingle();
     return data ? { id: data.id, userId: data.user_id, title: data.title, createdAt: data.created_at, messages: data.messages ?? [] } : null;
@@ -388,6 +461,7 @@ export async function getConversation(userId: string, id: string): Promise<Conve
 }
 
 export async function deleteConversation(userId: string, id: string): Promise<void> {
+  await ensureHydrated();
   if (backend === "supabase") {
     await sb().from("ai_conversations").delete().eq("id", id).eq("user_id", userId);
     return;
@@ -396,7 +470,7 @@ export async function deleteConversation(userId: string, id: string): Promise<vo
   const conv = d.convs[id];
   if (conv && conv.userId === userId) {
     delete d.convs[id];
-    save(d);
+    await save(d);
   }
 }
 
@@ -408,6 +482,7 @@ function period(): string {
 }
 
 export async function getUsage(userId: string): Promise<Usage> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { data } = await sb().from("usage_ledger").select("data").eq("user_id", userId).eq("period", period()).maybeSingle();
     return (data?.data as Usage) ?? { plansGenerated: 0, assistantMessages: 0, period: period() };
@@ -418,6 +493,7 @@ export async function getUsage(userId: string): Promise<Usage> {
 }
 
 export async function bumpUsage(userId: string, field: "plansGenerated" | "assistantMessages"): Promise<void> {
+  await ensureHydrated();
   const usage = await getUsage(userId);
   usage[field] += 1;
   if (backend === "supabase") {
@@ -426,10 +502,11 @@ export async function bumpUsage(userId: string, field: "plansGenerated" | "assis
   }
   const d = db();
   d.usage[userId] = usage;
-  save(d);
+  await save(d);
 }
 
 export async function getFavorites(userId: string): Promise<string[]> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { data } = await sb().from("favorite_recipes").select("recipe_id").eq("user_id", userId);
     return (data ?? []).map((r) => r.recipe_id);
@@ -438,6 +515,7 @@ export async function getFavorites(userId: string): Promise<string[]> {
 }
 
 export async function toggleFavorite(userId: string, recipeId: string): Promise<boolean> {
+  await ensureHydrated();
   if (backend === "supabase") {
     const { data } = await sb().from("favorite_recipes").select("recipe_id").eq("user_id", userId).eq("recipe_id", recipeId).maybeSingle();
     if (data) {
@@ -451,11 +529,12 @@ export async function toggleFavorite(userId: string, recipeId: string): Promise<
   const favs = d.favorites[userId] ?? [];
   const has = favs.includes(recipeId);
   d.favorites[userId] = has ? favs.filter((f) => f !== recipeId) : [...favs, recipeId];
-  save(d);
+  await save(d);
   return !has;
 }
 
-export function logAgentRun(run: { userId?: string; agent: string; action: string; status: "ok" | "error" | "fallback"; detail?: string; ms?: number }) {
+export async function logAgentRun(run: { userId?: string; agent: string; action: string; status: "ok" | "error" | "fallback"; detail?: string; ms?: number }) {
+  await ensureHydrated();
   try {
     if (backend === "supabase") {
       void sb().from("ai_agent_runs").insert({
@@ -465,7 +544,7 @@ export function logAgentRun(run: { userId?: string; agent: string; action: strin
       const d = db();
       d.agentRuns.push({ ...run, at: new Date().toISOString() });
       if (d.agentRuns.length > 1000) d.agentRuns = d.agentRuns.slice(-500);
-      save(d);
+      await save(d);
     }
   } catch {
     // never break the request path

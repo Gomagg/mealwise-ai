@@ -135,10 +135,12 @@ See `.env.example`. Nothing is required to run locally. Notable ones:
 
 ### Deployment note
 
-On Vercel the JSON fallback is written to the function's temporary directory (`os.tmpdir()`), because
-the deployment filesystem is read-only. That keeps the full journey working in a demo, but the file is
-**per-instance and ephemeral**: accounts, plans and lists can disappear between cold starts or when a
-request lands on another instance. For a real deployment, configure Supabase
+On Vercel the JSON fallback is written to the function's temporary directory
+(`os.tmpdir()`), because the deployment filesystem is read-only. When a Vercel Blob store is
+linked (`BLOB_READ_WRITE_TOKEN` present), the app hydrates the JSON document from Blob on use and
+mirrors every write back to `mealwise/db.json`, so accounts, plans and lists survive cold starts
+and land on other instances. Blob is a private store; last write wins, so the JSON fallback is still
+a demo backend, not a multi-writer production database. For a real deployment, configure Supabase
 (`NEXT_PUBLIC_SUPABASE_URL` + `SUPABASE_SERVICE_ROLE_KEY`), run the migration, and use the Supabase
 backend. The build itself needs no credentials.
 

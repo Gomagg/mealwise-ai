@@ -126,7 +126,7 @@ export async function generateMealPlan(
 
     const issues = validatePlan(plan, req);
     if (issues.length > 0) {
-      db.logAgentRun({ userId: profile.id, agent: "orchestrator", action: "validate", status: "error", detail: issues.join("; ") });
+      await db.logAgentRun({ userId: profile.id, agent: "orchestrator", action: "validate", status: "error", detail: issues.join("; ") });
       return { ok: false, error: "The generated plan failed a dietary check. Please adjust your restrictions and try again." };
     }
 
@@ -135,7 +135,7 @@ export async function generateMealPlan(
     await db.savePlan(plan);
     await db.saveList(list);
     await db.bumpUsage(profile.id, "plansGenerated");
-    db.logAgentRun({ userId: profile.id, agent: "orchestrator", action: "generate", status: "ok", detail: `${req.days}d ${req.people}p ${req.meals.length}m`, ms: Date.now() - started });
+    await db.logAgentRun({ userId: profile.id, agent: "orchestrator", action: "generate", status: "ok", detail: `${req.days}d ${req.people}p ${req.meals.length}m`, ms: Date.now() - started });
 
     const parts = [
       `Created a ${req.days}-day plan for ${req.people} ${req.people === 1 ? "person" : "people"} with ${req.meals.length} meals a day.`,
@@ -145,7 +145,7 @@ export async function generateMealPlan(
     ];
     return { ok: true, plan, list, explanation: parts.join(" ") };
   } catch (err) {
-    db.logAgentRun({ userId: profile.id, agent: "orchestrator", action: "generate", status: "error", detail: err instanceof Error ? err.message : "unknown" });
+    await db.logAgentRun({ userId: profile.id, agent: "orchestrator", action: "generate", status: "error", detail: err instanceof Error ? err.message : "unknown" });
     return { ok: false, error: err instanceof Error ? err.message : "Could not generate a plan." };
   }
 }
@@ -198,7 +198,7 @@ export async function replaceMeal(
     const fresh = buildGroceryList(plan, pantry);
     await db.saveList({ ...fresh, id: list.id, createdAt: list.createdAt });
   }
-  db.logAgentRun({ userId: profile.id, agent: "meal-planner", action: "replace", status: "ok", detail: pick.id });
+  await db.logAgentRun({ userId: profile.id, agent: "meal-planner", action: "replace", status: "ok", detail: pick.id });
   return { ok: true, plan, message: `Replaced with ${pick.name}.` };
 }
 
@@ -302,9 +302,9 @@ export async function chatWithAssistant(
     if (ai.ok) {
       reply = ai.text;
       mode = "ai";
-      db.logAgentRun({ userId: profile.id, agent: "assistant", action: "chat", status: "ok", detail: ai.provider });
+      await db.logAgentRun({ userId: profile.id, agent: "assistant", action: "chat", status: "ok", detail: ai.provider });
     } else {
-      db.logAgentRun({ userId: profile.id, agent: "assistant", action: "chat", status: "fallback", detail: ai.error });
+      await db.logAgentRun({ userId: profile.id, agent: "assistant", action: "chat", status: "fallback", detail: ai.error });
     }
   }
 
